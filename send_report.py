@@ -1,142 +1,243 @@
 # =============================================================================
-# Author: Mustafa Nassar 
-# Version: 3.0
-# This script demonstrates how to send an email with an attachment using the Microsoft Graph API.
+# send_report.py
+# Author  : Mustafa Nassar
+# Version : 4.0
+# GitHub  : https://github.com/Nassar-m/GraphAPI
+# =============================================================================
 #
-# Description:
-# - Uses MSAL (Microsoft Authentication Library) for authentication.
-# - Utilizes the Microsoft Graph API for sending emails, including file attachments.
-# - Requires an Azure AD application with the following permissions:
-#   - Application Permission: "Mail.Send"
-#   - Scope: "https://graph.microsoft.com/.default"
-# - The script sends an email with an attachment to a specified recipient.
-# - All configurable variables (like Azure credentials, recipient email, and file path) are declared at the beginning.
-# - Suppresses debug logs for `urllib3` and `msal` for cleaner output.
+# Send email via Microsoft Graph API using application (daemon) authentication.
+# Supports plain-text and HTML bodies, optional file attachments, and
+# multiple recipients. Credentials are read from environment variables so
+# nothing sensitive ever lives in source code.
 #
-# Required Python Libraries:
-# - msal (`pip install msal`)
-# - requests (`pip install requests`)
+# QUICK START
+# -----------
+#   1. Register an Azure AD app and grant Mail.Send (Application permission).
+#      Grant admin consent.
 #
-# Make sure to update the variables (CLIENT_ID, CLIENT_SECRET, TENANT_ID, etc.) with your credentials.
+#   2. Export credentials as environment variables (or add them to a .env file
+#      and load with python-dotenv):
+#
+#       export GRAPH_CLIENT_ID="<your-client-id>"
+#       export GRAPH_CLIENT_SECRET="<your-client-secret>"
+#       export GRAPH_TENANT_ID="<your-tenant-id>"
+#
+#   3. Install dependencies:
+#
+#       pip install msal requests
+#
+#   4. Edit the CONFIGURATION BLOCK below and run:
+#
+#       python send_report.py
+#
+# AZURE PERMISSIONS REQUIRED
+# --------------------------
+#   Microsoft Graph > Application permissions > Mail.Send
+#   (Admin consent required)
+#
 # =============================================================================
 
 import os
 import base64
+import mimetypes
+import logging
 import msal
 import requests
-import logging
 
-# ====================
-# CONFIGURATION BLOCK
-# ====================
-# Azure AD App Credentials
-CLIENT_ID = "915a5ce2-9346-4120-asa7-7caa4378052e"  # Your Azure App Client ID
-CLIENT_SECRET = "WWa;sdlfkajd;sfjad;fja;ldfY"  # Your Azure App Secret
-TENANT_ID = "5d223e2382c-d230-4e2e-84a6-02390537fbdce"  # Your Azure Tenant ID
-AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
-SCOPE = ["https://graph.microsoft.com/.default"]
+# =============================================================================
+# CONFIGURATION BLOCK — edit these values before running
+# =============================================================================
 
-# Email Settings
-SENDER_EMAIL = "sender@domain.local"  # The email address of the sender
-RECIPIENT_EMAIL = "recipient@domain.de"  # The email address of the recipient
-EMAIL_SUBJECT = "Your Requested Report from OnPrem"  # Email subject
-EMAIL_BODY = "Please find the attached report."  # Email body content
+# --- Azure AD credentials (read from environment variables) ------------------
+# Never hardcode secrets in source code. Set these in your shell or .env file.
+CLIENT_ID     = os.environ.get("GRAPH_CLIENT_ID",     "")
+CLIENT_SECRET = os.environ.get("GRAPH_CLIENT_SECRET", "")
+TENANT_ID     = os.environ.get("GRAPH_TENANT_ID",     "")
 
-# Optional File Attachment
-ATTACHMENT_PATH = r"C:\Users\mnass\Downloads\pythonApp\Report.txt"  # Path to the attachment file (comment out if not needed)
+# --- Email settings ----------------------------------------------------------
+SENDER_EMAIL    = "reports@yourdomain.com"          # Mailbox the app sends FROM
+RECIPIENT_EMAIL = ["recipient@yourdomain.com"]       # One address or a list
+EMAIL_SUBJECT   = "Automated Report"
+EMAIL_BODY      = "Please find the attached report."
+EMAIL_BODY_TYPE = "Text"                             # "Text" or "HTML"
 
-# Microsoft Graph Endpoint
-ENDPOINT = f"https://graph.microsoft.com/v1.0/users/{SENDER_EMAIL}/sendMail"
+# --- Attachment (set to None to send without an attachment) ------------------
+ATTACHMENT_PATH = None                               # e.g. "/reports/output.xlsx"
 
-# ====================
-# LOGGING CONFIGURATION
-# ====================
-# Set the logging level for urllib3 and msal to WARNING
-logging.getLogger('urllib3').setLevel(logging.WARNING)
-logging.getLogger('msal').setLevel(logging.WARNING)
+# --- Graph API ---------------------------------------------------------------
+GRAPH_ENDPOINT = "https://graph.microsoft.com/v1.0"
+SCOPE          = ["https://graph.microsoft.com/.default"]
+AUTHORITY      = f"https://login.microsoftonline.com/{TENANT_ID}"
 
-# If you want to suppress all debug messages, set the root logger level to WARNING
-logging.basicConfig(level=logging.WARNING)
+# =============================================================================
+# LOGGING
+# =============================================================================
 
-# ====================
-# AUTHENTICATION
-# ====================
-print("Acquiring access token...")  # Log progress for user visibility
-app = msal.ConfidentialClientApplication(
-    CLIENT_ID,
-    authority=AUTHORITY,
-    client_credential=CLIENT_SECRET
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
+# Suppress verbose output from underlying HTTP and auth libraries
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("msal").setLevel(logging.WARNING)
 
-# Acquire an access token from Microsoft Identity Platform
-result = app.acquire_token_for_client(scopes=SCOPE)
+log = logging.getLogger(__name__)
 
-# Check if the token acquisition was successful
-if "access_token" in result:
-    access_token = result["access_token"]
-    print("Access token acquired successfully.")
-else:
-    print("Error acquiring access token.")
-    print(f"Error: {result.get('error')}")
-    print(f"Description: {result.get('error_description')}")
-    exit()
+# =============================================================================
+# FUNCTIONS
+# =============================================================================
 
-# ====================
-# PREPARE EMAIL
-# ====================
-print("Preparing the email...")  # Log progress for user visibility
-file_name = os.path.basename(ATTACHMENT_PATH)  # Extract the file name from the file path
+def validate_config() -> None:
+    """
+    Fail fast if required environment variables are missing.
+    Catches the most common setup mistake before making any network calls.
+    """
+    missing = [
+        name for name, val in {
+            "GRAPH_CLIENT_ID":     CLIENT_ID,
+            "GRAPH_CLIENT_SECRET": CLIENT_SECRET,
+            "GRAPH_TENANT_ID":     TENANT_ID,
+        }.items() if not val
+    ]
+    if missing:
+        raise EnvironmentError(
+            f"Missing required environment variable(s): {', '.join(missing)}\n"
+            "Set them in your shell or a .env file before running this script."
+        )
 
-# Read and encode the attachment file in Base64
-try:
-    with open(ATTACHMENT_PATH, 'rb') as file:
-        file_content = file.read()
-        encoded_content = base64.b64encode(file_content).decode('utf-8')
-except FileNotFoundError:
-    print(f"Error: File not found at {ATTACHMENT_PATH}. Please check the file path.")
-    exit()
 
-# Construct the email message payload
-email_msg = {
-    "message": {
+def acquire_token() -> str:
+    """
+    Authenticate against Microsoft Identity Platform using the
+    client credentials flow (application / daemon authentication).
+
+    Returns the raw access token string.
+    Raises RuntimeError if authentication fails.
+    """
+    app = msal.ConfidentialClientApplication(
+        CLIENT_ID,
+        authority=AUTHORITY,
+        client_credential=CLIENT_SECRET,
+    )
+    result = app.acquire_token_for_client(scopes=SCOPE)
+
+    if "access_token" in result:
+        log.info("Access token acquired.")
+        return result["access_token"]
+
+    raise RuntimeError(
+        f"Authentication failed. Error: {result.get('error')} — "
+        f"{result.get('error_description')}"
+    )
+
+
+def build_attachment(file_path: str) -> dict:
+    """
+    Read a file from disk, Base64-encode it, and return a Graph API
+    fileAttachment object ready to include in the message payload.
+
+    Raises FileNotFoundError if the path does not exist.
+    """
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"Attachment not found: {file_path}")
+
+    file_name = os.path.basename(file_path)
+    mime_type, _ = mimetypes.guess_type(file_path)
+    mime_type = mime_type or "application/octet-stream"
+
+    with open(file_path, "rb") as fh:
+        encoded = base64.b64encode(fh.read()).decode("utf-8")
+
+    log.info("Attachment ready: %s (%s)", file_name, mime_type)
+
+    return {
+        "@odata.type": "#microsoft.graph.fileAttachment",
+        "name":         file_name,
+        "contentType":  mime_type,
+        "contentBytes": encoded,
+    }
+
+
+def build_payload(attachment: dict | None = None) -> dict:
+    """
+    Construct the Graph API sendMail request body.
+
+    Accepts a single recipient string or a list of strings for
+    RECIPIENT_EMAIL. Includes the attachment only when one is provided.
+    """
+    recipients = (
+        [RECIPIENT_EMAIL] if isinstance(RECIPIENT_EMAIL, str) else RECIPIENT_EMAIL
+    )
+
+    message: dict = {
         "subject": EMAIL_SUBJECT,
         "body": {
-            "contentType": "Text",
-            "content": EMAIL_BODY
+            "contentType": EMAIL_BODY_TYPE,
+            "content":     EMAIL_BODY,
         },
         "toRecipients": [
-            {
-                "emailAddress": {
-                    "address": RECIPIENT_EMAIL
-                }
-            }
+            {"emailAddress": {"address": addr}} for addr in recipients
         ],
-        "attachments": [
-            {
-                "@odata.type": "#microsoft.graph.fileAttachment",
-                "name": file_name,
-                "contentType": "application/octet-stream",
-                "contentBytes": encoded_content
-            }
-        ]
     }
-}
 
-# ====================
-# SEND EMAIL
-# ====================
-print("Sending the email...")  # Log progress for user visibility
-headers = {
-    'Authorization': f'Bearer {access_token}',  # Include the access token for authentication
-    'Content-Type': 'application/json'  # Specify the content type for JSON payload
-}
+    if attachment:
+        message["attachments"] = [attachment]
 
-# Send the email via Microsoft Graph API
-response = requests.post(ENDPOINT, headers=headers, json=email_msg)
+    return {"message": message, "saveToSentItems": True}
 
-# Check the response from the Graph API
-if response.status_code == 202:  # Status code 202 indicates success
-    print("Email sent successfully.")
-else:
-    print(f"Error sending email: {response.status_code}")
-    print("Response details:", response.json())
+
+def send_mail(token: str, payload: dict) -> None:
+    """
+    POST the message payload to the Graph API sendMail endpoint.
+
+    Raises requests.HTTPError on non-2xx responses so the caller can
+    handle or log the failure.
+    """
+    url     = f"{GRAPH_ENDPOINT}/users/{SENDER_EMAIL}/sendMail"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type":  "application/json",
+    }
+
+    response = requests.post(url, headers=headers, json=payload, timeout=30)
+
+    if response.status_code == 202:
+        log.info("Email sent successfully.")
+    else:
+        # Surface the Graph API error detail for easier debugging
+        try:
+            detail = response.json()
+        except Exception:
+            detail = response.text
+        raise requests.HTTPError(
+            f"Graph API returned {response.status_code}: {detail}"
+        )
+
+
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
+
+if __name__ == "__main__":
+    try:
+        validate_config()
+
+        token      = acquire_token()
+        attachment = build_attachment(ATTACHMENT_PATH) if ATTACHMENT_PATH else None
+        payload    = build_payload(attachment)
+
+        send_mail(token, payload)
+
+    except EnvironmentError as exc:
+        log.error("Configuration error: %s", exc)
+        raise SystemExit(1)
+    except FileNotFoundError as exc:
+        log.error("Attachment error: %s", exc)
+        raise SystemExit(1)
+    except RuntimeError as exc:
+        log.error("Authentication error: %s", exc)
+        raise SystemExit(1)
+    except requests.HTTPError as exc:
+        log.error("Send failed: %s", exc)
+        raise SystemExit(1)
